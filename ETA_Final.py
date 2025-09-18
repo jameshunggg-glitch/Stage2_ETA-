@@ -46,12 +46,20 @@ map_center_lat = df_filtered['Lat'].mean()
 map_center_lon = df_filtered['Lng_360'].mean()
 
 # 先清理 SOG 異常值
-
+'''''
 sog_min, sog_max = 0, 50  # 合理範圍
 before_len = len(df_filtered)
 df_filtered = df_filtered[(df_filtered['Sog'] >= sog_min) & (df_filtered['Sog'] <= sog_max)].reset_index(drop=True)
 after_len = len(df_filtered)
 print(f"[INFO] 移除異常 SOG 筆數: {before_len - after_len}, 剩餘: {after_len}")
+'''
+# 設定時間閾值
+threshold = pd.to_datetime("2025-07-25 10:58:10")
+
+# 條件更新 Sog 欄位
+df_filtered.loc[df_filtered['CreateTime'] > threshold, 'Sog'] = (
+    df_filtered.loc[df_filtered['CreateTime'] > threshold, 'Sog'] / 10
+)
 
 df_filtered = df_filtered.sort_values('CreateTime').reset_index(drop=True)
 
@@ -344,9 +352,9 @@ plt.show()
 
 # 預測ETA 在這裡改就好
 #------------------------------
-prelon = 125.67835
-prelat = 27.771015
-presog = 13.61
+prelon = 127.351456
+prelat = 28.822489
+presog = 14.412451347024524
 #------------------------------
 lat1 = radians(prelat)
 lon1 = radians(prelon)
