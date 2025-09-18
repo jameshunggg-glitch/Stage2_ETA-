@@ -276,11 +276,9 @@ for i, segment in enumerate(filtered_segments, 1):
 stops_df = pd.DataFrame(stop_info)
 print(stops_df)
 
-print(stops_df.tail(15))
 # 看看哪些行是 voyage_id 為 NaN（通常是停泊點）
 df_filtered.loc[df_filtered['voyage_id'].isna(), ['CreateTime','Is_Stop','voyage_id','Real_ETA_sec']].tail(10)
 
-print(len(df_filtered[df_filtered['voyage_id']==1]))
 #篩掉點數小於10的航程
 # -----------------------------------
 # 篩選航程點數 >= 10
@@ -306,11 +304,21 @@ df_filtered["Destination"].value_counts()
 ## For Testing
 import numpy as np
 import pandas as pd
+from haversine import haversine
 
 # -----------------------------------
 # 確保時間排序
 # -----------------------------------
 df_filtered = df_filtered.sort_values('CreateTime').reset_index(drop=True)
+
+# -----------------------------------
+# 先清理 SOG 異常值
+# -----------------------------------
+sog_min, sog_max = 0, 50  # 合理範圍
+before_len = len(df_filtered)
+df_filtered = df_filtered[(df_filtered['Sog'] >= sog_min) & (df_filtered['Sog'] <= sog_max)].reset_index(drop=True)
+after_len = len(df_filtered)
+print(f"[INFO] 移除異常 SOG 筆數: {before_len - after_len}, 剩餘: {after_len}")
 
 # -----------------------------------
 # 計算經緯度差分
@@ -407,7 +415,7 @@ for i in range(len(filtered_segments) - 1):
 
     # Real_ETA_sec = 下一停泊區段時間均值 - 當前點時間
     eta_segment = filtered_segments[i+1]
-    eta_time = df_filtered.loc[eta_segment, 'CreateTime'].mean()
+    eta_time = df_filtered.loc[eta_segment, 'CreateTime'].min()
 
     df_filtered.loc[start_idx:end_idx, 'Real_ETA_sec'] = (
         (eta_time - df_filtered.loc[start_idx:end_idx, 'CreateTime']).dt.total_seconds()
@@ -416,26 +424,58 @@ for i in range(len(filtered_segments) - 1):
     voyage_id += 1
 
 # -----------------------------------
-# 不再將第一段航程前的點標記為 voyage_id = 1
-# 保持為 NaN，這些點會在後續清理時丟掉
+# 新增「距離目的港」與「靠港判定」
 # -----------------------------------
+df_filtered['dist_to_dest_km'] = np.nan
+df_filtered['near_port_flag'] = np.nan
+
+# 建立 voyage_id → 目的港座標 mapping
+dest_map = {}
+for v in range(1, voyage_id):
+    if v < len(filtered_segments):
+        seg = filtered_segments[v]  # 下一停泊
+        dest_lat = df_filtered.loc[seg, 'Lat'].mean()
+        dest_lon360 = df_filtered.loc[seg, 'Lng_360'].mean()
+        # 把 0-360 轉 -180~180
+        dest_lon = dest_lon360 if dest_lon360 <= 180 else dest_lon360 - 360
+        dest_map[v] = (dest_lat, dest_lon)
+
+# 計算距離
+for idx, row in df_filtered.iterrows():
+    v = row['voyage_id']
+    if pd.notna(v):
+        v = int(v)
+        if v in dest_map:
+            lat1 = row['Lat']
+            lon1 = row['Lng_360']
+            lon1 = lon1 if lon1 <= 180 else lon1 - 360
+            lat2, lon2 = dest_map[v]
+            df_filtered.at[idx, 'dist_to_dest_km'] = haversine((lat1, lon1), (lat2, lon2))
+
+# 判定靠港 flag
+df_filtered.loc[df_filtered['dist_to_dest_km'] < 1.0, 'near_port_flag'] = 1.0
+df_filtered.loc[(df_filtered['dist_to_dest_km'] >= 1.0) & (df_filtered['dist_to_dest_km'] <= 5.0), 'near_port_flag'] = 0.5
+df_filtered.loc[df_filtered['dist_to_dest_km'] > 5.0, 'near_port_flag'] = 0.0
 
 # -----------------------------------
 # 檢查結果
 # -----------------------------------
-print(df_filtered[['CreateTime','Lat','Lng_360','Sog','Is_Stop','voyage_id','Real_ETA_sec']].head(20))
+print(df_filtered[['CreateTime','Lat','Lng_360','Sog','Is_Stop',
+                   'voyage_id','Real_ETA_sec',
+                   'dist_to_dest_km','near_port_flag']].head(20))
+
 
 #篩掉點數小於10的航程
 # -----------------------------------
 # 篩選航程點數 >= 10
 # -----------------------------------
-voyage_counts = df_filtered.groupby('voyage_id').size()
+#voyage_counts = df_filtered.groupby('voyage_id').size()
 
 # 找出點數 >= 10 的 voyage_id
-valid_voyages = voyage_counts[voyage_counts >= 10].index
+#valid_voyages = voyage_counts[voyage_counts >= 10].index
 
 # 只保留有效航程
-df_filtered = df_filtered[df_filtered['voyage_id'].isin(valid_voyages)].copy()
+#df_filtered = df_filtered[df_filtered['voyage_id'].isin(valid_voyages)].copy()
 
 # 丟掉 voyage_id 或 Real_ETA_sec 為 NaN 的資料
 df_filtered = df_filtered.dropna(subset=['voyage_id', 'Real_ETA_sec']).reset_index(drop=True)
@@ -445,8 +485,9 @@ df_filtered = df_filtered.dropna(subset=['voyage_id', 'Real_ETA_sec']).reset_ind
 # -----------------------------------
 print("篩選後資料數量:", len(df_filtered))
 print(df_filtered[['CreateTime','Lat','Lng_360','Sog','Is_Stop','voyage_id','Real_ETA_sec']].head(20))
+df_filtered['near_port_flag'].value_counts()
+
 ## Random Forest
-#Fist try: 7 features
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -456,7 +497,7 @@ import numpy as np
 # 選特徵 (示範可選)
 # -----------------------------
 numeric_features = [
-    'Lat', 'Lng_360', 'Sog', 'Delta_Lat', 'Delta_Long', 'Delta_Time'
+    'Lat', 'Lng_360', 'Sog','near_port_flag'
 ]
 
 X = df_filtered[numeric_features]
@@ -554,7 +595,6 @@ plt.title("Random Forest Feature Importances")
 plt.tight_layout()
 plt.show()
 
-#Try only 3 Features
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -564,7 +604,7 @@ import numpy as np
 # 選特徵 (示範可選)
 # -----------------------------
 numeric_features = [
-    'Lat', 'Lng_360', 'Sog'
+    'Lat', 'Lng_360', 'Sog', 'dist_to_dest_km', 'near_port_flag'
 ]
 
 X = df_filtered[numeric_features]
@@ -715,3 +755,102 @@ plt.legend(['Ideal line', 'Other points', 'Close to port'])
 plt.ylim(0, max_eta)
 plt.xlim(0, max_eta)
 plt.show()
+
+# 複製一份 df_filtered
+df_plot = df_filtered.copy()
+
+# 對全部資料做預測
+numeric_features = ['Lat', 'Lng_360', 'Sog', 'near_port_flag']
+X_all = df_plot[numeric_features]
+
+# 使用已訓練好的模型做預測
+df_plot['Pred_Real_ETA_sec'] = rf_model.predict(X_all)
+
+# 檢查前幾筆
+df_plot[['CreateTime', 'voyage_id', 'Real_ETA_sec', 'Pred_Real_ETA_sec']].head(10)
+
+# 條件：實際ETA < 10000，預測ETA > 30000
+condition_idx = df_plot[
+    (df_plot['Real_ETA_sec'] < 50000) &
+    (df_plot['Pred_Real_ETA_sec'] > 100000)
+].index
+
+# 印出每個點及其前後五筆資料
+for idx in condition_idx:
+    start = max(idx - 5, 0)
+    end = min(idx + 5 + 1, len(df_plot))  # +1 因為slice不包含end
+    print(f"\n=== Index {idx} (Real_ETA_sec={df_plot.loc[idx, 'Real_ETA_sec']:.1f}, "
+          f"Pred_Real_ETA_sec={df_plot.loc[idx, 'Pred_Real_ETA_sec']:.1f}) ===")
+    display(df_plot.loc[start:end, ['CreateTime','Lat','Lng_360','Sog',
+                                        'voyage_id','Real_ETA_sec','Pred_Real_ETA_sec']])
+
+## Time To Predict!
+#先建立換座標程式碼
+#目前資訊 2025/9/17 /15:47
+# sog :12.0节 纬度： 25-41.181N 经度： 121-56.643E 目的地： WAKAYAMA,JP
+from math import radians, sin, cos, sqrt, atan2
+
+# 轉換為弧度
+lat1 = radians(27.677572)
+lon1 = radians(125.52714)
+lat2 = radians(34.21535)
+lon2 = radians(135.13684)
+
+# 哈弗辛公式
+dlat = lat2 - lat1
+dlon = lon2 - lon1
+a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+c = 2 * atan2(sqrt(a), sqrt(1-a))
+
+# 地球半徑（公里）
+R = 6371.0
+
+# 計算距離
+distance = R * c
+print(f"剩餘距離：{distance:.2f} 公里")
+
+import numpy as np
+
+
+# 假設這是從 API 獲取的即時船舶資料
+new_data = {
+    'Lat': 27.61578,
+    'Lng_360': 125.419655,
+    'Sog': 13.11,
+    'dist_to_dest_km': 1168.73,
+    'near_port_flag': 0.0
+}
+
+# 將資料轉換為 DataFrame
+new_df = pd.DataFrame([new_data])
+
+# 使用標準化器進行資料標準化
+
+
+# 使用模型進行預測
+predicted_eta = rf_model.predict(new_df)
+
+# 顯示預測結果
+print(f"預測的剩餘到港時間：{predicted_eta[0]:.2f} 秒")
+
+from datetime import datetime, timedelta
+
+# 假設 predicted_eta 是模型的輸出（秒）
+predicted_eta = predicted_eta.astype(float)[0]  
+
+# 1. 取得現在時間
+now = datetime.now()
+
+# 2. 換成 timedelta（四捨五入到分鐘）
+eta_timedelta = timedelta(seconds=round(predicted_eta))
+
+# 3. 加到現在時間
+predicted_arrival = now + eta_timedelta
+
+# 4. 輸出結果
+print("現在時間:", now.strftime("%Y-%m-%d %H:%M:%S"))
+print("預測到港時間:", predicted_arrival.strftime("%Y-%m-%d %H:%M"))
+
+#model_1 預測到港時間大約 2025/09/20 19:15:00。
+#model_2 預測到港時間大約為 2025/09/20 16:25:52
+#搜船網預測到港時間為 2025/09/20 15:30:00
